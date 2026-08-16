@@ -1,0 +1,223 @@
+# Secure Private Container Registry with Image Lifecycle & Retention Policies
+### Using Amazon ECR, IAM, and Docker
+
+**Role:** DevOps Engineer
+**Objective:** Design and configure a secure container registry system with access control, lifecycle rules, and automated image cleanup.
+
+> **Note:** All AWS Account IDs and ARNs in this document are replaced with `<YOUR_ACCOUNT_ID>` placeholders. Replace them with your own account ID when reusing these policies.
+
+---
+
+## 1. Problem Statement
+
+The company was storing Docker images in **public repositories** with no control, causing:
+
+- **Security risk** — anyone on the internet could pull the images; accidental secrets baked into an image would be exposed.
+- **Storage bloat** — old, unused image versions were never cleaned up, driving up storage cost.
+- **No lifecycle management** — there was no automated way to retire outdated versions.
+
+**Goal:** Move to a **private** registry (Amazon ECR) with IAM-controlled access and an automatic cleanup policy, so old images expire on their own and only authorized identities can pull/push.
+
+---
+
+## 2. Architecture
+
+```
+┌───────────────────────┐        docker push/pull        ┌─────────────────────────────┐
+│   EC2 Instance          │ ─────────────────────────────> │   Amazon ECR (Private)        │
+│   (Docker host)         │                                  │   Repository: my-app-repo     │
+│   IAM Role attached:    │ <───────────────────────────── │                                │
+│   EC2-ECR-Access-Role   │                                  │  Images: v1, v2, v3, v4,      │
+└───────────────────────┘                                  │  latest                        │
+                                                              │  + Lifecycle Policy            │
+                                                              │  + Repository Policy           │
+                                                              └─────────────────────────────┘
+                                                                          ▲
+                                                                          │ ecr:DescribeRepositories (DENIED)
+                                                              ┌─────────────────────────────┐
+                                                              │  IAM User: test-user          │
+                                                              │  (no ECR permissions)         │
+                                                              └─────────────────────────────┘
+```
+
+---
+
+## 3. Implementation Steps
+
+### Step 1 — EC2 Docker Host Setup
+1. Launched an Amazon Linux EC2 instance (`docker-ecr-host`).
+2. Attached an IAM Role (`EC2-ECR-Access-Role`) with `AmazonEC2ContainerRegistryFullAccess`, so the instance can authenticate to ECR without storing static credentials.
+3. Installed Docker:
+   ```bash
+   sudo yum install docker -y
+   sudo systemctl start docker
+   sudo systemctl enable docker
+   sudo usermod -aG docker ec2-user
+   ```
+
+### Step 2 — Private ECR Repository
+1. Created a private repository: **`my-app-repo`**
+2. Settings used:
+   - Tag mutability: **Mutable** (allows overwriting `latest`)
+   - Encryption: **AES-256**
+   - **Scan on push: enabled** (each pushed image is automatically scanned for vulnerabilities)
+
+### Step 3 — Image Build, Tag, and Push
+Built a simple Docker image (nginx serving a static `index.html`, see [`docker/`](./docker)) and pushed multiple tagged versions to simulate real release cycles:
+
+```bash
+docker build -t <YOUR_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/my-app-repo:v1 .
+docker push <YOUR_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/my-app-repo:v1
+
+# repeat for v2, v3, v4 after modifying index.html
+
+docker tag <YOUR_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/my-app-repo:v2 <YOUR_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/my-app-repo:latest
+docker push <YOUR_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/my-app-repo:latest
+```
+
+Final image set in the repository: **v1, v2, v3, v4, latest** (latest points to the same image as v2 in this exercise — in practice it should always point to the newest release).
+
+![ECR repository showing v1, v2, v3, v4, latest tags](./screenshots/01-ecr-images-list.png)
+
+### Step 4 — Lifecycle Policy (Automated Cleanup)
+Created a lifecycle rule directly on `my-app-repo`. Full policy: [`policies/lifecycle-policy.json`](./policies/lifecycle-policy.json)
+
+```json
+{
+  "rules": [
+    {
+      "rulePriority": 1,
+      "description": "keep last 3 images",
+      "selection": {
+        "tagStatus": "any",
+        "countType": "imageCountMoreThan",
+        "countNumber": 3
+      },
+      "action": {
+        "type": "expire"
+      }
+    }
+  ]
+}
+```
+
+**Logic:** Once the repository holds more than 3 images (across any tag), the oldest image beyond that count is automatically expired (deleted). ECR evaluates and applies this rule within 24 hours of a change; the **Preview rules** feature was used to validate the logic immediately without waiting.
+
+![Lifecycle policy rule configured: keep last 3 images, expire the rest](./screenshots/02-lifecycle-policy-rule.png)
+
+**Proof of cleanup logic (Preview Rules result):** `v1` — the oldest image — is correctly identified for expiry once the count exceeds 3.
+
+![Preview rules result showing v1 marked for expiry](./screenshots/03-preview-cleanup-proof.png)
+
+### Step 5 — Repository Policy (Access Control)
+Attached a resource-based policy to the repository restricting who can interact with it. Full policy: [`policies/repository-policy.json`](./policies/repository-policy.json)
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowPullForDevRole",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::<YOUR_ACCOUNT_ID>:role/EC2-ECR-Access-Role" },
+      "Action": [
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage",
+        "ecr:BatchCheckLayerAvailability"
+      ]
+    },
+    {
+      "Sid": "DenyAllOtherAccounts",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["ecr:*"],
+      "Condition": {
+        "StringNotEquals": { "aws:PrincipalAccount": "<YOUR_ACCOUNT_ID>" }
+      }
+    }
+  ]
+}
+```
+
+**Logic:**
+- Only the `EC2-ECR-Access-Role` (the role attached to the Docker host) is explicitly granted pull permissions.
+- Any principal outside this AWS account is explicitly denied all ECR actions on this repository — a defense-in-depth guardrail on top of standard IAM permissions.
+
+![Repository policy showing Allow and Deny statements](./screenshots/04-repository-permissions.png)
+
+---
+
+## 4. Security Validation
+
+Created a separate IAM user, `test-user`, with **no ECR permissions attached**, to simulate an unauthorized caller. Attempted to list repositories using that identity:
+
+```bash
+aws ecr describe-repositories --profile test-user
+```
+
+**Result — access correctly denied:**
+```
+An error occurred (AccessDeniedException) when calling the DescribeRepositories operation:
+User: arn:aws:iam::<YOUR_ACCOUNT_ID>:user/test-user is not authorized to perform:
+ecr:DescribeRepositories on resource: arn:aws:ecr:us-east-2:<YOUR_ACCOUNT_ID>:repository/*
+because no identity-based policy allows the ecr:DescribeRepositories action
+```
+
+![Terminal showing AccessDeniedException for unauthorized test-user](./screenshots/05-unauthorized-access-denied.png)
+
+This confirms IAM is correctly enforcing least-privilege access — an identity without an explicit ECR grant cannot read or interact with the registry, even though it belongs to the same AWS account.
+
+---
+
+## 5. Image Governance Explained
+
+| Control | What it does | Why it matters |
+|---|---|---|
+| **Private repository** (vs. public Docker Hub) | Images are only reachable by authenticated, authorized identities within the account | Prevents accidental public exposure of proprietary code, configs, or secrets baked into an image |
+| **Scan on push** | Every image is automatically scanned for known CVEs on push | Catches vulnerable base images/dependencies before they reach production |
+| **IAM Role-based push/pull** (`EC2-ECR-Access-Role`) | Only the Docker build host's role can pull; no long-lived static credentials required | Removes the risk of leaked access keys; access is tied to the EC2 instance's identity |
+| **Repository policy deny-by-default for other accounts** | Explicit deny for any principal outside the account | Defense-in-depth — even a misconfigured IAM policy elsewhere can't leak cross-account access |
+| **Lifecycle policy (retain last 3, expire rest)** | Automatically deletes the oldest images once the count exceeds 3 | Controls storage cost and prevents unbounded growth, without manual cleanup |
+| **Proper tagging (v1, v2, v3... + latest)** | Every build is versioned instead of overwriting a single tag | Enables rollback to a known-good version and gives the lifecycle policy something meaningful to act on |
+
+---
+
+## 6. Risk Mitigation Summary
+
+| Risk (Before) | Mitigation (After) |
+|---|---|
+| Public repository exposure | Private ECR repository, account-scoped access only |
+| No cleanup — unbounded storage growth/cost | Lifecycle policy expires images beyond the last 3 |
+| Any IAM identity could interact with images | Repository policy + IAM role scoping restrict access to an explicit, audited role |
+| No visibility into image vulnerabilities | Scan on push flags CVEs automatically |
+| No version history / no rollback path | Proper `v1`, `v2`, `v3`... tagging preserves a rollback trail |
+
+---
+
+## 7. Repository Structure
+
+```
+aws-ecr-governance-project/
+├── README.md
+├── policies/
+│   ├── repository-policy.json
+│   └── lifecycle-policy.json
+├── docker/
+│   ├── Dockerfile
+│   └── index.html
+└── screenshots/
+    ├── 01-ecr-images-list.png
+    ├── 02-lifecycle-policy-rule.png
+    ├── 03-preview-cleanup-proof.png
+    ├── 04-repository-permissions.png
+    └── 05-unauthorized-access-denied.png
+```
+
+## 8. Deliverables
+
+- [x] `policies/repository-policy.json` — access control policy attached to `my-app-repo`
+- [x] `policies/lifecycle-policy.json` — retention rule (keep last 3, expire older)
+- [x] `docker/Dockerfile` + `docker/index.html` — sample image source
+- [x] Screenshot: ECR **Preview rules** result showing `v1` marked for expiry (proof of cleanup logic)
+- [x] Screenshot/terminal output: `AccessDeniedException` for unauthorized `test-user` (proof of access restriction)
+- [x] This README — governance design, policy logic, risk mitigation, and validation steps

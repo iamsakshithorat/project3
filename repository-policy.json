@@ -1,0 +1,30 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowPullForDevRole",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::<YOUR_ACCOUNT_ID>:role/EC2-ECR-Access-Role"
+      },
+      "Action": [
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage",
+        "ecr:BatchCheckLayerAvailability"
+      ]
+    },
+    {
+      "Sid": "DenyAllOtherAccounts",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": [
+        "ecr:*"
+      ],
+      "Condition": {
+        "StringNotEquals": {
+          "aws:PrincipalAccount": "<YOUR_ACCOUNT_ID>"
+        }
+      }
+    }
+  ]
+}
